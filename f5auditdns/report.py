@@ -1,0 +1,133 @@
+"""Excel and CSV reporting for F5AuditDNS.
+
+The report contains evidence and proposed commands for human change review only.
+"""
+from __future__ import annotations
+
+import csv
+import re
+from pathlib import Path
+from typing import Any
+
+from .analyzer import Audit
+
+SHEETS = [
+    ("Summary", "summary"),
+    ("Wide IP Findings", "wideips"),
+    ("GSLB Pool Findings", "pools"),
+    ("Pool Members", "members"),
+    ("GSLB Servers", "servers"),
+    ("GSLB Virtual Servers", "virtuals"),
+    ("Data Centers", "datacenters"),
+    ("DNS Chains", "chains"),
+    ("Cleanup Candidates", "candidates"),
+    ("LTM Inventories", "ltm_inventory"),
+    ("Manual Review", "manual_review"),
+    ("Auxiliary Inventory", "auxiliary"),
+    ("Collection Health", "collection_health"),
+]
+
+
+STATUS_COLORS = {
+    "AVAILABLE": ("DCFCE7", "166534"), "OFFLINE": ("FEE2E2", "991B1B"),
+    "UNAVAILABLE": ("FEF3C7", "92400E"), "DISABLED": ("E2E8F0", "334155"),
+    "UNKNOWN": ("DBEAFE", "1E40AF"), "NOT OBSERVED": ("F1F5F9", "475569"),
+}
+
+IDENTITY_COLUMNS = {
+    "pools": ("Type", "Pool"), "members": ("Type", "Pool", "Member", "GSLB Server", "Virtual Server"),
+    "virtuals": ("Server", "Virtual Server"), "candidates": ("Type", "Object", "GSLB Pool", "GSLB Server"),
+}
+PRIORITY_COLUMNS = ("Destination", "Destination IP", "Port", "Route Domain", "Service",
+                    "Health", "Config", "LTM Comparison", "LTM Location", "LTM Matched Virtual Server",
+                    "LTM Health", "Verdict", "Referenced by", "Member count", "Status Reason", "Health Source")
+
+
+def _columns(rows, attribute):
+    ordered = dict.fromkeys(k for row in rows for k in row)
+    if attribute in IDENTITY_COLUMNS:
+        priority = (*IDENTITY_COLUMNS[attribute], *PRIORITY_COLUMNS)
+        return [k for k in priority if k in ordered] + [k for k in ordered if k not in priority]
+    return list(ordered)
+
+
+def _safe_cell(value: Any) -> Any:
+    """Prevent spreadsheet-formula injection from BIG-IP object names/descriptions."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "YES" if value else "NO"
+    if isinstance(value, (float, int)):
+        return value
+    text = str(value)
+    if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text[:32000]
+
+
+def as_csv(audit: Audit, directory: str | Path) -> list[str]:
+    folder = Path(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for title, name in SHEETS:
+        rows: list[dict[str, Any]] = getattr(audit, name)
+        if not rows:
+            continue
+        dest = folder / (re.sub(r"[^a-zA-Z0-9_-]", "_", title) + ".csv")
+        columns = _columns(rows, name)
+        with dest.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: _safe_cell(row.get(k, "")) for k in columns})
+        paths.append(str(dest))
+    return paths
+
+
+def as_excel(audit: Audit, filename: str | Path) -> str:
+    """Export a readable multi-tab workbook, styled similarly to F5Audit LTM."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, attribute in SHEETS:
+        ws = wb.create_sheet(title)
+        rows: list[dict[str, Any]] = getattr(audit, attribute)
+        if not rows:
+            ws.append(["No records in this section"])
+            ws.column_dimensions["A"].width = 36
+            continue
+        keys = _columns(rows, attribute)
+        ws.append(keys)
+        ws.freeze_panes = "A2"
+        for c in ws[1]:
+            c.fill = PatternFill("solid", fgColor="19344D")
+            c.font = Font(color="FFFFFF", bold=True)
+            c.alignment = Alignment(vertical="center", wrap_text=True)
+        ws.row_dimensions[1].height = 28
+        for index, row in enumerate(rows, 2):
+            ws.append([_safe_cell(row.get(k, "")) for k in keys])
+            if index % 2 == 0:
+                for cell in ws[index]:
+                    cell.fill = PatternFill("solid", fgColor="F1F5F9")
+            for cell in ws[index]:
+                if keys[cell.column - 1] in ("Health", "LTM Health", "Availability"):
+                    colors = STATUS_COLORS.get(cell.value)
+                    if colors:
+                        cell.fill = PatternFill("solid", fgColor=colors[0])
+                        cell.font = Font(color=colors[1], bold=True)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for col, k in enumerate(keys, 1):
+            max_data = max([len(str(k))] + [len(str(r.get(k, ""))) for r in rows[:250]])
+            width = min(52, max(14, max_data + 2))
+            if k in ("Reason", "Status Reason", "LTM Evidence", "Note", "Notes", "Description", "Delete", "Rollback"):
+                width = 52
+            ws.column_dimensions[get_column_letter(col)].width = width
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = False
+    dest = Path(filename)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(dest)
+    return str(dest)
